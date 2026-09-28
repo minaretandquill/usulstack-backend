@@ -27,3 +27,5 @@ jq>=1.6.0
 typer>=0.9.0
 SQLAlchemy>=2.0.30
 aiomysql>=0.2.0
+greenlet
+
