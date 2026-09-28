@@ -126,6 +126,14 @@ class MiscNote(Base):
     updated_at: Mapped[str] = mapped_column(String(40), default=now_iso)
 
 
+class LoginAttempt(Base):
+    __tablename__ = "login_attempts"
+    identifier: Mapped[str] = mapped_column(String(191), primary_key=True)
+    fail_count: Mapped[int] = mapped_column(Integer, default=0)
+    locked_until: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
+    updated_at: Mapped[str] = mapped_column(String(40), default=now_iso)
+
+
 # ---------------- Serializers ----------------
 def sci_dict(s: Science) -> dict:
     return {"id": s.id, "name": s.name, "arabic_name": s.arabic_name or "", "description": s.description or "", "order": s.sort_order, "created_at": s.created_at}
@@ -277,11 +285,41 @@ async def collect_descendants(db: AsyncSession, tid: str) -> List[str]:
 
 # ---------------- Auth routes ----------------
 @api_router.post("/auth/login")
-async def login(data: LoginInput, db: AsyncSession = Depends(get_db)):
+async def login(data: LoginInput, request: Request, db: AsyncSession = Depends(get_db)):
     email = data.email.strip().lower()
+    fwd = request.headers.get("x-forwarded-for", "")
+    ip = fwd.split(",")[0].strip() if fwd else (request.client.host if request.client else "unknown")
+    identifier = f"{ip}:{email}"[:191]
+    now = datetime.now(timezone.utc)
+
+    attempt = (await db.execute(select(LoginAttempt).where(LoginAttempt.identifier == identifier))).scalar_one_or_none()
+    if attempt and attempt.locked_until:
+        try:
+            locked_until = datetime.fromisoformat(attempt.locked_until)
+        except Exception:
+            locked_until = None
+        if locked_until and locked_until > now:
+            mins = int((locked_until - now).total_seconds()) // 60 + 1
+            raise HTTPException(status_code=429, detail=f"Too many failed attempts. Try again in {mins} minute(s).")
+
     user = (await db.execute(select(User).where(User.email == email))).scalar_one_or_none()
     if not user or not verify_password(data.password, user.password_hash):
+        if not attempt:
+            attempt = LoginAttempt(identifier=identifier, fail_count=0)
+            db.add(attempt)
+        attempt.fail_count = (attempt.fail_count or 0) + 1
+        attempt.updated_at = now_iso()
+        if attempt.fail_count >= 5:
+            attempt.locked_until = (now + timedelta(minutes=15)).isoformat()
+            attempt.fail_count = 0
+        await db.commit()
         raise HTTPException(status_code=401, detail="Invalid email or password")
+
+    if attempt:
+        attempt.fail_count = 0
+        attempt.locked_until = None
+        attempt.updated_at = now_iso()
+        await db.commit()
     token = create_access_token(user.id, user.email)
     return {"access_token": token, "user": {"id": user.id, "email": user.email, "name": user.name, "role": user.role}}
 
@@ -571,6 +609,16 @@ async def update_miscnote(mid: str, data: MiscNoteUpdate, user: dict = Depends(g
 @api_router.delete("/miscnotes/{mid}")
 async def delete_miscnote(mid: str, user: dict = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     await db.execute(sql_delete(MiscNote).where(MiscNote.id == mid))
+    await db.commit()
+    return {"ok": True}
+
+
+@api_router.post("/miscnotes/reorder")
+async def reorder_miscnotes(data: ReorderIn, user: dict = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    for i, mid in enumerate(data.ids):
+        m = (await db.execute(select(MiscNote).where(MiscNote.id == mid))).scalar_one_or_none()
+        if m:
+            m.sort_order = i
     await db.commit()
     return {"ok": True}
 
